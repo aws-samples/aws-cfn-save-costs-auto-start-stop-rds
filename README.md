@@ -48,24 +48,41 @@ e.g. :
     sam delete --stack-name sam-auto-start-stop-rds --region us-west-1
 
 
+### Configurations
+When implementing this solution with Amazon RDS tags, you can pick between two configurations. Depending on the your business needs, you can use either or both:
+
+* <b>Fixed time</b> – A fixed time setup has the following components:
+    * A single schedule applies to all RDS instances; for example you need to start several non-prod instances at a fixed time, such as daily at 9:00 AM, and stop them at 6:00 PM
+    * The start and stop times are configured in an EventBridge rule cron in the UTC time zone
+    * You can enable the solution by setting a <code>true</code> Boolean flag (case insensitive) value in the Amazon RDS tag key’s value
+    * You disable the setup by not creating tags or by setting the <code>false</code> Boolean value (case insensitive) in the Amazon RDS tag
+    * The tag keys are <code>AutoStart</code> and <code>AutoStop</code>
+* <b>Flexible time</b> – A flexible time setup has the following components:
+    * A different time schedule applies to each RDS instance; for example, if you want to start some servers at 7:00 AM, some at 8:30 AM, and so on, and stop some at 4:00 PM, some at 6:00 PM, and so on
+    * The start and stop times are configured in Amazon RDS tags in HH:MM format in the time zone of the Region in which Amazon RDS is hosted
+    * You enable this setup by setting the time value in the Amazon RDS tag key’s value
+    * You disable this setup by not creating a tag or by setting a blank value (empty or <code>null</code>) in the Amazon RDS tag
+    * The tag keys are <code>StartWeekDay</code>, <code>StopWeekDay</code>, <code>StartWeekEnd</code>, and <code>StopWeekEnd</code>
+
+
 ### Features
 We use the following high-level features to configure and implement this solution:
 
-*	Tags – Configure 6 predefined tags in Amazon RDS:
+*	<b>Tags</b> – Configure 6 predefined tags in Amazon RDS:
     *	AutoStart – Set value as <code>True</code> or <code>False</code> (case insensitive) with a schedule set in the auto start rule
     *	AutoStop – Set value as <code>True</code> or <code>False</code> (case insensitive) with a schedule set in the auto stop rule
     * StartWeekDay – Set value in HH:MM to start on a weekday (Monday to Friday)
     * StopWeekDay – Set value in HH:MM to stop on a weekday (Monday to Friday)
     *	StartWeekEnd – Set value in HH:MM to start on a weekend (Saturday to Sunday)
     *	StopWeekEnd – Set value in HH:MM to stop on a weekend (Saturday to Sunday)
-*	Lambda – Configure 6 Lambda functions:
+*	<b>Lambda</b> – Configure 6 Lambda functions:
     *	Auto start (AutoStartRDSInstance)
     *	Auto stop (AutoStopRDSInstance)
     *	Weekend start (RDSStartWeekEnd)
     *	Weekend stop (RDSStopWeekEnd)
     *	Weekday start (RDSStartWeekDay)
     *	Weekday stop (RDSStopWeekDay)
-*	Rule – Create 4 EventBridge rules with cron schedule in UTC:
+*	<b>Rule</b> – Create 4 EventBridge rules with cron schedule in UTC:
     *	Auto start (AutoStartRDSRule)
         *	Default schedule is cron (<code>0 13 ? * MON-FRI *</code>)
         *	Auto start instance (Mon–Fri 9:00 AM EST / 1:00 PM UTC)
@@ -82,22 +99,22 @@ We use the following high-level features to configure and implement this solutio
 
 ### Resources
 Following AWS resources are created from this template :
-  *	Lambda functions:
+  *	<b>Lambda functions</b>:
       *	AutoStartRDSInstance
       *	AutoStopRDSInstance
       *	RDSStartWeekDay
       *	RDSStopWeekDay
       *	RDSStartWeekEnd
       *	RDSStopWeekEnd
-  *	EventBridge rules:
+  *	<b>EventBridge rules</b>:
       *	AutoStartRDSRule
       *	AutoStopRDSRule
       *	RDSStartStopWeekDayRule
       *	RDSStartStopWeekEndRule
-  *	IAM resources:
+  *	<b>IAM resources</b>:
       *	LambdaRDSStartStopRole (role)
       *	LambdaRDSStartStopPolicy (inline policy)
-  *	CloudWatch log groups:
+  *	<b>CloudWatch log groups</b>:
       *	/aws/lambda/AutoStartRDSInstance
       *	/aws/lambda/AutoStopRDSInstance
       *	/aws/lambda/RDSStartWeekDay
