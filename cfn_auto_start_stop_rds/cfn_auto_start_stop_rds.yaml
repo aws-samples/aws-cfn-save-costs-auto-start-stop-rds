@@ -1,0 +1,1176 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  This Cloudformation template creates resources to Schedule Auto Start-Stop of RDS instances to save cost.
+  This involves creating 1 IAM Role with inline Policy, 6 Lambda functions with Permissions and 4 EventBridge Rules.
+  User also gets 5 Parameter options, in which 4 to be set in EventBridge Rules and 1 to set in Lambda Functions Environment variable.
+  Written by - Pinesh Singal (spinesh@), last modified 21-Dec-2021
+
+Parameters:
+  AutoStartRDSSchedule:
+    Default: cron(0 13 ? * MON-FRI *)
+    Description: Auto Start RDS Instance (Mon-Fri 9:00 AM EST / 1:00 PM GMT), enter a Schedule expression e.g. cron(0 13 ? * MON-FRI *), see https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  AutoStopRDSSchedule:
+    Default: cron(0 1 ? * MON-FRI *)
+    Description: Auto Stop RDS Instance (Mon-Fri 9:00 PM EST / 1:00 AM GMT), enter a Schedule expression e.g. cron(0 1 ? * MON-FRI *), see https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  RDSStartStopWeekDaySchedule:
+    Default: cron(*/5 * ? * MON-FRI *)
+    Description: RDS Start Stop triggering every Week Day every 5 mins
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  RDSStartStopWeekEndSchedule:
+    Default: cron(*/5 * ? * SAT-SUN *)
+    Description: RDS Start Stop triggering every Week End every 5 mins
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  RegionTZ:
+    Default: UTC
+    Type: String
+    AllowedValues:
+      - UTC
+      - US/Eastern
+      - US/Pacific
+      - Africa/Johannesburg
+      - Asia/Hong_Kong
+      - Asia/Kolkata
+      - Asia/Tokyo
+      - Asia/Seoul
+      - Asia/Singapore
+      - Australia/Sydney
+      - Canada/Central
+      - Europe/Berlin
+      - Europe/Dublin
+      - Europe/London
+      - Europe/Rome
+      - Europe/Paris
+      - Europe/Stockholm
+      - Asia/Bahrain
+      - America/Sao_Paulo
+    Description: Select Timezone of your Region for execution time in Tags (Set as Lambda Environment Variable Key REGION_TZ)
+
+Resources:
+  LambdaRDSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      #RoleName: LambdaRDSStartStopRole
+      Description: IAM Role for Lambda to Start Stop RDS instances
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaRDSStartStopPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+                Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+
+  AutoStartRDSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AutoStartRDSInstance
+      Runtime: python3.9
+      MemorySize: 128
+      Role: !GetAtt
+        - LambdaRDSRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Code:
+        ZipFile: |
+            import boto3
+            import os
+
+            target_db = None
+            region = os.environ['AWS_REGION']
+            rds = boto3.client('rds', region_name=region)
+
+            def get_tags_for_db(db):
+                instance_arn = db['DBInstanceArn']
+                instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                return instance_tags['TagList']
+
+            def get_tags_for_db_cluster(db):
+                instance_arn = db['DBClusterArn']
+                instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                return instance_tags['TagList']
+
+            def lambda_handler(event, context):
+
+                dbs = rds.describe_db_instances()
+                readReplica = []
+                for db in dbs['DBInstances']:
+                    readReplicaDB = db['ReadReplicaDBInstanceIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBInstances']:
+                    db_id = db['DBInstanceIdentifier']
+                    db_engine = db['Engine']
+                    print('DB ID : ' + str(db_id))
+                    db_tags = get_tags_for_db(db)
+                    print("All Tags : " + str(db_tags))
+                    tag = next(iter(filter(lambda tag: tag['Key'] == 'AutoStart' and tag['Value'].lower() == 'true', db_tags)), None)
+                    print("AutoStart Tag : " + str(tag))
+
+                    if db_engine not in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(readReplica) == 0:
+                            if tag:
+                                target_db = db
+                                print("DB Details : " + str(target_db))
+                                db_id = target_db['DBInstanceIdentifier']
+                                db_status = target_db['DBInstanceStatus']
+                                print("DB ID : " + str(db_id))
+                                print("DB Status : " + str(db_status))
+                                if db_status == "stopped":
+                                    AutoStarting = rds.start_db_instance(DBInstanceIdentifier=db_id)
+                                    print("Starting DB : " + str(db_id))
+                                else:
+                                    print("Database already running : " + str(db_id))
+                            else:
+                                print("AutoStart Tag Key not set for Database to Start...")
+                        else:
+                            print("Cannot stop or start a Read-Replica Database...")
+
+                dbs = rds.describe_db_clusters()
+                readReplica = []
+                for db in dbs['DBClusters']:
+                    readReplicaDB = db['ReadReplicaIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBClusters']:
+                    db_id = db['DBClusterIdentifier']
+                    db_engine = db['Engine']
+                    print('DB ID : ' + str(db_id))
+                    db_tags = get_tags_for_db_cluster(db)
+                    print("All Tags : " + str(db_tags))
+                    tag = next(iter(filter(lambda tag: tag['Key'] == 'AutoStart' and tag['Value'].lower() == 'true', db_tags)), None)
+                    print("AutoStart Tag : " + str(tag))
+
+                    if db_engine in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(readReplica) == 0:
+                            if tag:
+                                target_db = db
+                                db_id = target_db['DBClusterIdentifier']
+                                db_status = target_db['Status']
+                                print("Cluster DB ID : " + str(db_id))
+                                print("Cluster DB Status : " + str(db_status))
+                                if db_status == "stopped":
+                                    AutoStarting = rds.start_db_cluster(DBClusterIdentifier=db_id)
+                                    print("Starting Cluster DB : " + str(db_id))
+                                else:
+                                    print("Cluster Database already running : " + str(db_id))
+                            else:
+                                print("AutoStart Tag Key not set for Cluster Database to Start...")
+                        else:
+                            print("Cannot stop or start a Read-Replica Cluster Database...")
+      Description: >-
+        Auto Start RDS Instance (from tag : AutoStart)
+
+  AutoStartRDSRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name : AutoStartRDSRule
+      Description: Auto Start RDS Instance (Mon-Fri 9:00 AM EST / 1:00 PM GMT)
+      ScheduleExpression: !Ref AutoStartRDSSchedule
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt AutoStartRDSLambda.Arn
+          Id: AutoStartRDSLambda
+
+  AutoStartRDSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AutoStartRDSLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn : !GetAtt AutoStartRDSRule.Arn
+
+
+  AutoStopRDSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AutoStopRDSInstance
+      Runtime: python3.9
+      MemorySize: 128
+      Role: !GetAtt
+        - LambdaRDSRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Code:
+        ZipFile: |
+            import boto3
+            import os
+
+            target_db = None
+            region = os.environ['AWS_REGION']
+            rds = boto3.client('rds', region_name=region)
+
+            def get_tags_for_db(db):
+                instance_arn = db['DBInstanceArn']
+                instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                return instance_tags['TagList']
+
+            def get_tags_for_db_cluster(db):
+                instance_arn = db['DBClusterArn']
+                instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                return instance_tags['TagList']
+
+            def lambda_handler(event, context):
+
+                dbs = rds.describe_db_instances()
+                readReplica = []
+                for db in dbs['DBInstances']:
+                    readReplicaDB = db['ReadReplicaDBInstanceIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBInstances']:
+                    db_id = db['DBInstanceIdentifier']
+                    db_engine = db['Engine']
+                    print('DB ID : ' + str(db_id))
+                    db_tags = get_tags_for_db(db)
+                    print("All Tags : " + str(db_tags))
+                    tag = next(iter(filter(lambda tag: tag['Key'] == 'AutoStop' and tag['Value'].lower() == 'true', db_tags)), None)
+                    print("AutoStop Tag : " + str(tag))
+
+                    if db_engine not in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(readReplica) == 0:
+                            if tag:
+                                target_db = db
+                                print("DB Details : " + str(target_db))
+                                db_id = target_db['DBInstanceIdentifier']
+                                db_status = target_db['DBInstanceStatus']
+                                print("DB ID : " + str(db_id))
+                                print("DB Status : " + str(db_status))
+                                if db_status == "available":
+                                    AutoStopping = rds.stop_db_instance(DBInstanceIdentifier=db_id)
+                                    print("Stopping DB : " + str(db_id))
+                                else:
+                                    print("Database already stopped : " + str(db_id))
+                            else:
+                                print("AutoStop Tag Key not set for Database to Stop...")
+                        else:
+                            print("Cannot stop or start a Read-Replica Database...")
+
+                dbs = rds.describe_db_clusters()
+                readReplica = []
+                for db in dbs['DBClusters']:
+                    readReplicaDB = db['ReadReplicaIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBClusters']:
+                    db_id = db['DBClusterIdentifier']
+                    db_engine = db['Engine']
+                    print('DB ID : ' + str(db_id))
+                    db_tags = get_tags_for_db_cluster(db)
+                    print("All Tags : " + str(db_tags))
+                    tag = next(iter(filter(lambda tag: tag['Key'] == 'AutoStop' and tag['Value'].lower() == 'true', db_tags)), None)
+                    print("AutoStop Tag : " + str(tag))
+
+                    if db_engine in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(readReplica) == 0:
+                            if tag:
+                                target_db = db
+                                db_id = target_db['DBClusterIdentifier']
+                                db_status = target_db['Status']
+                                print("Cluster DB ID : " + str(db_id))
+                                print("Cluster DB Status : " + str(db_status))
+                                if db_status == "available":
+                                    AutoStopping = rds.stop_db_cluster(DBClusterIdentifier=db_id)
+                                    print("Stopping Cluster DB : " + str(db_id))
+                                else:
+                                    print("Cluster Database already stopped : " + str(db_id))
+                            else:
+                                print("AutoStop Tag Key not set for Cluster Database to Stop...")
+                        else:
+                            print("Cannot stop or start a Read-Replica Cluster Database...")
+      Description: >-
+        Auto Stop RDS Instance (from tag : AutoStop)
+
+  AutoStopRDSRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name : AutoStopRDSRule
+      Description: Auto Stop RDS Instance (Mon-Fri 9:00 PM EST / 1:00 AM GMT)
+      ScheduleExpression: !Ref AutoStopRDSSchedule
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt AutoStopRDSLambda.Arn
+          Id: AutoStopRDSLambda
+
+  AutoStopRDSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AutoStopRDSLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn : !GetAtt AutoStopRDSRule.Arn
+
+
+  RDSStopWeekDayLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSStopWeekDay
+      Runtime: python3.9
+      MemorySize: 128
+      Role: !GetAtt
+        - LambdaRDSRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Code:
+        ZipFile: |
+            import boto3
+            import time
+            import datetime
+            import os
+
+            def set_region_tz():
+                timezone_var = None
+                #print(os.environ)
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+
+                try:
+                    timezone_var = os.environ['REGION_TZ']
+                    print("Lambda Environment Variable Key REGION_TZ available : " + str(timezone_var))
+                except Exception as e:
+                    timezone_var = os.environ['TZ']
+                    print("Lambda Environment Variable Key REGION_TZ not available : " + str(timezone_var))
+                print("Timezone Var : " + str(timezone_var))
+
+                if timezone_var is None or timezone_var == '':
+                    timezone = 'UTC'
+                else:
+                    timezone = timezone_var
+                print("Timezone : " + str(timezone))
+
+                os.environ['TZ'] = str(timezone)
+                time.tzset()
+                return
+
+            def lambda_handler(event, context):
+                flag = False
+                set_region_tz()
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+                week_day = datetime.datetime.now().isoweekday()  # Monday is 1 and Sunday is 7
+                time_plus = time_now + datetime.timedelta(minutes=5)
+                time_minus = time_now - datetime.timedelta(minutes=5)
+                aest_time = format(time_now, '%H:%M')
+                print("Week Day : " + str(week_day))
+                print("Time Now in HH:MM : " + aest_time)
+                max_aest_time = format(time_plus,'%H:%M')
+                min_aest_time = format(time_minus,'%H:%M')
+                count = 0
+
+                region = os.environ['AWS_REGION']
+                print("Region : " + str(region))
+
+                rds = boto3.client('rds', region_name=region)
+                dbs = rds.describe_db_instances()
+
+                readReplica = []
+                for db in dbs['DBInstances']:
+                    readReplicaDB = db['ReadReplicaDBInstanceIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                    #print("readReplicaDB : " + str(readReplicaDB))
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBInstances']:
+                    count = count + 1
+                    db_id = db['DBInstanceIdentifier']
+                    db_id_readreplica = db['ReadReplicaDBInstanceIdentifiers']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    print("DB ID Read Replica : " + str(db_id_readreplica))
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine not in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBInstanceArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StopWeekDay', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    #print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBInstanceIdentifier']
+                                    db_status = target_db['DBInstanceStatus']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 1 <= week_day <= 5):
+                                        if db_status == "available":
+                                            StopWeekDay = rds.stop_db_instance(DBInstanceIdentifier=db_id)
+                                            print("Stopping DB : " + str(db_id))
+                                        else:
+                                            print("Database not in Available or Running state : " + str(db_id))
+                                    else:
+                                        print("Database not available to Stop in given Week Day or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Database to Stop : " + str(tag_key))
+                            else:
+                                print("StopWeekDay Tag Key not set for Database to Stop")
+                        else:
+                            print("Read Replica Database not allowed to Stop : " + str(db_id))
+                    else:
+                        print("Aurora Engine Database")
+
+                readReplica = []
+                dbs = rds.describe_db_clusters()
+                for db in dbs['DBClusters']:
+                    #readReplicaDB = db['ReadReplicaDBClusterIdentifiers']
+                    readReplicaDB = db['ReadReplicaIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBClusters']:
+                    count = count + 1
+                    db_id = db['DBClusterIdentifier']
+                    #db_id_readreplica = db['ReadReplicaDBClusterIdentifiers']
+                    db_id_readreplica = db['ReadReplicaIdentifiers']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    print("DB ID Read Replica : " + str(db_id_readreplica))
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBClusterArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StopWeekDay', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    #print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBClusterIdentifier']
+                                    db_status = target_db['Status']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 1 <= week_day <= 5):
+                                        if db_status == "available":
+                                            StopWeekDay = rds.stop_db_cluster(DBClusterIdentifier=db_id)
+                                            print("Stopping Cluster DB : " + str(db_id))
+                                        else:
+                                            print("Cluster Database not in Available or Running state : " + str(db_id))
+                                    else:
+                                        print("Cluster Database not available to Stop in given Week Day or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Cluster Database to Stop : " + str(tag_key))
+                            else:
+                                print("StopWeekDay Tag Key not set for Cluster Database to Stop")
+                        else:
+                            print("Read Replica Cluster Database not allowed to Stop : " + str(db_id))
+
+                print("Total Instance Count : " + str(count))
+
+      Description: >-
+        RDS Stop Week Day Time in HH:MM	(from tag : StopWeekDay)
+
+  RDSStartWeekDayLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSStartWeekDay
+      Runtime: python3.9
+      MemorySize: 128
+      Role: !GetAtt
+        - LambdaRDSRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Code:
+        ZipFile: |
+            import boto3
+            import time
+            import datetime
+            import os
+
+            def set_region_tz():
+                timezone_var = None
+                #print(os.environ)
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+
+                try:
+                    timezone_var = os.environ['REGION_TZ']
+                    print("Lambda Environment Variable Key REGION_TZ available : " + str(timezone_var))
+                except Exception as e:
+                    timezone_var = os.environ['TZ']
+                    print("Lambda Environment Variable Key REGION_TZ not available : " + str(timezone_var))
+                print("Timezone Var : " + str(timezone_var))
+
+                if timezone_var is None or timezone_var == '':
+                    timezone = 'UTC'
+                else:
+                    timezone = timezone_var
+                print("Timezone : " + str(timezone))
+
+                os.environ['TZ'] = str(timezone)
+                time.tzset()
+                return
+
+            def lambda_handler(event, context):
+                flag = False
+                set_region_tz()
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+                week_day = datetime.datetime.now().isoweekday()  # Monday is 1 and Sunday is 7
+                time_plus = time_now + datetime.timedelta(minutes=5)
+                time_minus = time_now - datetime.timedelta(minutes=5)
+                aest_time = format(time_now, '%H:%M')
+                print("Week Day : " + str(week_day))
+                print("Time Now in HH:MM : " + aest_time)
+                max_aest_time = format(time_plus,'%H:%M')
+                min_aest_time = format(time_minus,'%H:%M')
+                count = 0
+
+                region = os.environ['AWS_REGION']
+                print("Region : " + str(region))
+
+                rds = boto3.client('rds', region_name=region)
+                dbs = rds.describe_db_instances()
+
+                readReplica = []
+                for db in dbs['DBInstances']:
+                    readReplicaDB = db['ReadReplicaDBInstanceIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBInstances']:
+                    count = count + 1
+                    db_id = db['DBInstanceIdentifier']
+                    db_id_readreplica = db['ReadReplicaDBInstanceIdentifiers']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    print("DB ID Read Replica : " + str(db_id_readreplica))
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine not in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBInstanceArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StartWeekDay', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBInstanceIdentifier']
+                                    db_status = target_db['DBInstanceStatus']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 1 <= week_day <= 5):
+                                        if db_status == "stopped":
+                                            StartWeekDay = rds.start_db_instance(DBInstanceIdentifier=db_id)
+                                            print("Starting DB : " + str(db_id))
+                                        else:
+                                            print("Database not in Stopped state : " + str(db_id))
+                                    else:
+                                        print("Database not available to Start in given Week Day or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Database to Start : " + str(tag_key))
+                            else:
+                                print("StartWeekDay Tag Key not set for Database to Start")
+                        else:
+                            print("Read Replica Database not allowed to Start : " + str(db_id))
+                    else:
+                        print("Aurora Engine Database")
+
+
+                readReplica = []
+                dbs = rds.describe_db_clusters()
+                for db in dbs['DBClusters']:
+                    #readReplicaDB = db['ReadReplicaDBClusterIdentifiers']
+                    readReplicaDB = db['ReadReplicaIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBClusters']:
+                    count = count + 1
+                    db_id = db['DBClusterIdentifier']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    #db_id_readreplica = db['ReadReplicaDBClusterIdentifiers']
+                    db_id_readreplica = db['ReadReplicaIdentifiers']
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBClusterArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StartWeekDay', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBClusterIdentifier']
+                                    db_status = target_db['Status']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 1 <= week_day <= 5):
+                                        if db_status == "stopped":
+                                            StartWeekDay = rds.start_db_cluster(DBClusterIdentifier=db_id)
+                                            print("Starting Cluster DB : " + str(db_id))
+                                        else:
+                                            print("Cluster Database not in Stopped state : " + str(db_id))
+                                    else:
+                                        print("Cluster Database not available to Start in given Week Day or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Cluster Database to Start : " + str(tag_key))
+                            else:
+                                print("StartWeekDay Tag Key not set for Cluster Database to Start")
+                        else:
+                            print("Read Replica Cluster Database not allowed to Start : " + str(db_id))
+
+                print("Total Instance Count : " + str(count))
+      Description: >-
+        RDS Start Week Day Time in HH:MM (from tag : StartWeekDay)
+
+  RDSStartStopWeekDayRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name : RDSStartStopWeekDayRule
+      Description: RDS Start Stop triggering every Week Day every 5 mins
+      ScheduleExpression: !Ref RDSStartStopWeekDaySchedule
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt RDSStartWeekDayLambda.Arn
+          Id: RDSStartWeekDayLambda
+        -
+          Arn: !GetAtt RDSStopWeekDayLambda.Arn
+          Id: RDSStopWeekDayLambda
+
+  RDSStartWeekDayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RDSStartWeekDayLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn : !GetAtt RDSStartStopWeekDayRule.Arn
+
+  RDSStopWeekDayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RDSStopWeekDayLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn : !GetAtt RDSStartStopWeekDayRule.Arn
+
+
+  RDSStopWeekEndLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSStopWeekEnd
+      Runtime: python3.9
+      MemorySize: 128
+      Role: !GetAtt
+        - LambdaRDSRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Code:
+        ZipFile: |
+            import boto3
+            import time
+            import datetime
+            import os
+
+            def set_region_tz():
+                timezone_var = None
+                #print(os.environ)
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+
+                try:
+                    timezone_var = os.environ['REGION_TZ']
+                    print("Lambda Environment Variable Key REGION_TZ available : " + str(timezone_var))
+                except Exception as e:
+                    timezone_var = os.environ['TZ']
+                    print("Lambda Environment Variable Key REGION_TZ not available : " + str(timezone_var))
+                print("Timezone Var : " + str(timezone_var))
+
+                if timezone_var is None or timezone_var == '':
+                    timezone = 'UTC'
+                else:
+                    timezone = timezone_var
+                print("Timezone : " + str(timezone))
+
+                os.environ['TZ'] = str(timezone)
+                time.tzset()
+                return
+
+            def lambda_handler(event, context):
+                flag = False
+                set_region_tz()
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+                week_day = datetime.datetime.now().isoweekday()  # Monday is 1 and Sunday is 7
+                time_plus = time_now + datetime.timedelta(minutes=5)
+                time_minus = time_now - datetime.timedelta(minutes=5)
+                aest_time = format(time_now, '%H:%M')
+                print("Week Day : " + str(week_day))
+                print("Time Now in HH:MM : " + aest_time)
+                max_aest_time = format(time_plus,'%H:%M')
+                min_aest_time = format(time_minus,'%H:%M')
+                count = 0
+
+                region = os.environ['AWS_REGION']
+                print("Region : " + str(region))
+
+                rds = boto3.client('rds', region_name=region)
+                dbs = rds.describe_db_instances()
+
+                readReplica = []
+                for db in dbs['DBInstances']:
+                    readReplicaDB = db['ReadReplicaDBInstanceIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                    #print("readReplicaDB : " + str(readReplicaDB))
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBInstances']:
+                    count = count + 1
+                    db_id = db['DBInstanceIdentifier']
+                    db_id_readreplica = db['ReadReplicaDBInstanceIdentifiers']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    print("DB ID Read Replica : " + str(db_id_readreplica))
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine not in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBInstanceArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StopWeekEnd', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    #print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBInstanceIdentifier']
+                                    db_status = target_db['DBInstanceStatus']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 6 <= week_day <= 7):
+                                        if db_status == "available":
+                                            StopWeekEnd = rds.stop_db_instance(DBInstanceIdentifier=db_id)
+                                            print("Stopping DB : " + str(db_id))
+                                        else:
+                                            print("Database not in Available or Running state : " + str(db_id))
+                                    else:
+                                        print("Database not available to Stop in given Week End or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Database to Stop : " + str(tag_key))
+                            else:
+                                print("StopWeekEnd Tag Key not set for Database to Stop")
+                        else:
+                            print("Read Replica Database not allowed to Stop : " + str(db_id))
+                    else:
+                        print("Aurora Engine Database")
+
+
+                readReplica = []
+                dbs = rds.describe_db_clusters()
+                for db in dbs['DBClusters']:
+                    #readReplicaDB = db['ReadReplicaDBClusterIdentifiers']
+                    readReplicaDB = db['ReadReplicaIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBClusters']:
+                    count = count + 1
+                    db_id = db['DBClusterIdentifier']
+                    #db_id_readreplica = db['ReadReplicaDBClusterIdentifiers']
+                    db_id_readreplica = db['ReadReplicaIdentifiers']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    print("DB ID Read Replica : " + str(db_id_readreplica))
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBClusterArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StopWeekEnd', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    #print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBClusterIdentifier']
+                                    db_status = target_db['Status']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 6 <= week_day <= 7):
+                                        if db_status == "available":
+                                            StopWeekEnd = rds.stop_db_cluster(DBClusterIdentifier=db_id)
+                                            print("Stopping Cluster DB : " + str(db_id))
+                                        else:
+                                            print("Cluster Database not in Available or Running state : " + str(db_id))
+                                    else:
+                                        print("Cluster Database not available to Stop in given Week End or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Cluster Database to Stop : " + str(tag_key))
+                            else:
+                                print("StopWeekEnd Tag Key not set for Cluster Database to Stop")
+                        else:
+                            print("Read Replica Cluster Database not allowed to Stop : " + str(db_id))
+
+                print("Total Instance Count : " + str(count))
+
+      Description: >-
+        RDS Stop Week End Time in HH:MM	(from tag : StopWeekEnd)
+
+  RDSStartWeekEndLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSStartWeekEnd
+      Runtime: python3.9
+      MemorySize: 128
+      Role: !GetAtt
+        - LambdaRDSRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Code:
+        ZipFile: |
+            import boto3
+            import time
+            import datetime
+            import os
+
+            def set_region_tz():
+                timezone_var = None
+                #print(os.environ)
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+
+                try:
+                    timezone_var = os.environ['REGION_TZ']
+                    print("Lambda Environment Variable Key REGION_TZ available : " + str(timezone_var))
+                except Exception as e:
+                    timezone_var = os.environ['TZ']
+                    print("Lambda Environment Variable Key REGION_TZ not available : " + str(timezone_var))
+                print("Timezone Var : " + str(timezone_var))
+
+                if timezone_var is None or timezone_var == '':
+                    timezone = 'UTC'
+                else:
+                    timezone = timezone_var
+                print("Timezone : " + str(timezone))
+
+                os.environ['TZ'] = str(timezone)
+                time.tzset()
+                return
+
+            def lambda_handler(event, context):
+                flag = False
+                set_region_tz()
+
+                time_now = datetime.datetime.now()
+                print("Time Now : " + str(time_now))
+                week_day = datetime.datetime.now().isoweekday()  # Monday is 1 and Sunday is 7
+                time_plus = time_now + datetime.timedelta(minutes=5)
+                time_minus = time_now - datetime.timedelta(minutes=5)
+                aest_time = format(time_now, '%H:%M')
+                print("Week Day : " + str(week_day))
+                print("Time Now in HH:MM : " + aest_time)
+                max_aest_time = format(time_plus,'%H:%M')
+                min_aest_time = format(time_minus,'%H:%M')
+                count = 0
+
+                region = os.environ['AWS_REGION']
+                print("Region : " + str(region))
+
+                rds = boto3.client('rds', region_name=region)
+                dbs = rds.describe_db_instances()
+
+                readReplica = []
+                for db in dbs['DBInstances']:
+                    readReplicaDB = db['ReadReplicaDBInstanceIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBInstances']:
+                    count = count + 1
+                    db_id = db['DBInstanceIdentifier']
+                    db_id_readreplica = db['ReadReplicaDBInstanceIdentifiers']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    print("DB ID Read Replica : " + str(db_id_readreplica))
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine not in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBInstanceArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StartWeekEnd', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBInstanceIdentifier']
+                                    db_status = target_db['DBInstanceStatus']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 6 <= week_day <= 7):
+                                        if db_status == "stopped":
+                                            StartWeekEnd = rds.start_db_instance(DBInstanceIdentifier=db_id)
+                                            print("Starting DB : " + str(db_id))
+                                        else:
+                                            print("Database not in Stopped state : " + str(db_id))
+                                    else:
+                                        print("Database not available to Start in given Week Day or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Database to Start : " + str(tag_key))
+                            else:
+                                print("StartWeekEnd Tag Key not set for Database to Start")
+                        else:
+                            print("Read Replica Database not allowed to Start : " + str(db_id))
+                    else:
+                        print("Aurora Engine Database")
+
+
+                readReplica = []
+                dbs = rds.describe_db_clusters()
+                for db in dbs['DBClusters']:
+                    #readReplicaDB = db['ReadReplicaDBClusterIdentifiers']
+                    readReplicaDB = db['ReadReplicaIdentifiers']
+                    readReplica.extend(readReplicaDB)
+                print("readReplica : " + str(readReplica))
+
+                for db in dbs['DBClusters']:
+                    count = count + 1
+                    db_id = db['DBClusterIdentifier']
+                    db_engine = db['Engine']
+                    print("DB ID : " + str(db_id))
+                    #db_id_readreplica = db['ReadReplicaDBClusterIdentifiers']
+                    db_id_readreplica = db['ReadReplicaIdentifiers']
+                    print("DB Engine : " + str(db_engine))
+
+                    if db_engine in ['aurora-mysql','aurora-postgresql']:
+                        if db_id not in readReplica and len(db_id_readreplica) == 0:
+                            instance_arn = db['DBClusterArn']
+                            instance_tags = rds.list_tags_for_resource(ResourceName=instance_arn)
+                            db_tags = instance_tags['TagList']
+                            print("All Tags : " + str(db_tags))
+
+                            tag = next(iter(filter(lambda tag: tag['Key'] == 'StartWeekEnd', db_tags)), None)
+                            print("Tag : " + str(tag))
+
+                            if tag:
+                                tag_key = tag['Key']
+                                print("Tag Key : " + str(tag_key))
+
+                                tag_value = tag['Value']
+                                print("Tag Value : " + str(tag_value))
+
+                                if tag_key and tag_value:
+                                    target_db = db
+                                    print("DB Details : " + str(target_db))
+                                    db_id = target_db['DBClusterIdentifier']
+                                    db_status = target_db['Status']
+                                    print("DB ID : " + str(db_id))
+                                    print("DB Status : " + str(db_status))
+
+                                    if (min_aest_time <= tag_value <= max_aest_time and 6 <= week_day <= 7):
+                                        if db_status == "stopped":
+                                            StartWeekEnd = rds.start_db_cluster(DBClusterIdentifier=db_id)
+                                            print("Starting Cluster DB : " + str(db_id))
+                                        else:
+                                            print("Cluster Database not in Stopped state : " + str(db_id))
+                                    else:
+                                        print("Cluster Database not available to Start in given Week Day or Time Schedule : " + str(db_id))
+                                else:
+                                    print("Either Tag Key or Tag Value is not set for Cluster Database to Start : " + str(tag_key))
+                            else:
+                                print("StartWeekEnd Tag Key not set for Cluster Database to Start")
+                        else:
+                            print("Read Replica Cluster Database not allowed to Start : " + str(db_id))
+
+                print("Total Instance Count : " + str(count))
+      Description: >-
+        RDS Start Week End Time in HH:MM (from tag : StartWeekEnd)
+
+  RDSStartStopWeekEndRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name : RDSStartStopWeekEndRule
+      Description: RDS Start Stop triggering every Week End every 5 mins
+      ScheduleExpression: !Ref RDSStartStopWeekEndSchedule
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt RDSStartWeekEndLambda.Arn
+          Id: RDSStartWeekEndLambda
+        -
+          Arn: !GetAtt RDSStopWeekEndLambda.Arn
+          Id: RDSStopWeekEndLambda
+
+  RDSStartWeekEndLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RDSStartWeekEndLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn : !GetAtt RDSStartStopWeekEndRule.Arn
+
+  RDSStopWeekEndLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RDSStopWeekEndLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn : !GetAtt RDSStartStopWeekEndRule.Arn
+
+Outputs:
+  RegionTZOutput:
+    Description: AWS Region Timezone
+    Value: !Ref RegionTZ
+
+  AWSRegionOutput:
+    Description: AWS Region
+    Value: !Ref AWS::Region
