@@ -1,0 +1,307 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  This AWS SAM (Serverless Application Model) template creates CFN resources to Schedule Auto Start-Stop of RDS instances to save cost.
+  This involves creating 6 Lambda functions with IAM Policies and Schedule Events in EventBridge Rules.
+  User also gets 5 Parameter options, in which 4 to be set in EventBridge Rules and 1 to set in Lambda Functions Environment variable.
+  Written by - Pinesh Singal (spinesh@), last modified 20-Dec-2021
+
+Parameters:
+  AutoStartRDSSchedule:
+    Default: cron(0 13 ? * MON-FRI *)
+    Description: Auto Start RDS Instance (Mon-Fri 9:00 AM EST / 1:00 PM GMT), enter a Schedule expression e.g. cron(0 13 ? * MON-FRI *), see https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  AutoStopRDSSchedule:
+    Default: cron(0 1 ? * MON-FRI *)
+    Description: Auto Stop RDS Instance (Mon-Fri 9:00 PM EST / 1:00 AM GMT), enter a Schedule expression e.g. cron(0 1 ? * MON-FRI *), see https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  RDSStartStopWeekDaySchedule:
+    Default: cron(*/5 * ? * MON-FRI *)
+    Description: RDS Start Stop triggering every Week Day every 5 mins
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  RDSStartStopWeekEndSchedule:
+    Default: cron(*/5 * ? * SAT-SUN *)
+    Description: RDS Start Stop triggering every Week End every 5 mins
+    Type: String
+    MinLength: 20
+    MaxLength: 30
+  RegionTZ:
+    Default: UTC
+    Type: String
+    AllowedValues:
+      - UTC
+      - US/Eastern
+      - US/Pacific
+      - Africa/Johannesburg
+      - Asia/Hong_Kong
+      - Asia/Kolkata
+      - Asia/Tokyo
+      - Asia/Seoul
+      - Asia/Singapore
+      - Australia/Sydney
+      - Canada/Central
+      - Europe/Berlin
+      - Europe/Dublin
+      - Europe/London
+      - Europe/Rome
+      - Europe/Paris
+      - Europe/Stockholm
+      - Asia/Bahrain
+      - America/Sao_Paulo
+    Description: Select Timezone of your Region for execution time in Tags (Set as Lambda Environment Variable Key REGION_TZ)
+
+Resources:
+
+  AutoStartRDSLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: AutoStartRDSInstance
+      Runtime: python3.9
+      MemorySize: 128
+      Handler: AutoStartRDSInstance.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+              Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+      CodeUri: ./lambda/AutoStartRDSInstance.py
+      Events:
+        AutoStartRDSRule:
+          Type: Schedule
+          Properties:
+            Name: AutoStartRDSRule
+            Description: "Auto Start RDS Instance (Mon-Fri 9:00 AM EST / 1:00 PM GMT)"
+            Schedule: !Ref AutoStartRDSSchedule
+            Enabled: true
+      Description: >-
+        Auto Start RDS Instance (from tag : AutoStart)
+
+  AutoStopRDSLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: AutoStopRDSInstance
+      Runtime: python3.9
+      MemorySize: 128
+      Handler: AutoStopRDSInstance.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+              Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+      CodeUri: ./lambda/AutoStopRDSInstance.py
+      Events:
+        AutoStopRDSRule:
+          Type: Schedule
+          Properties:
+            Name: AutoStopRDSRule
+            Description: "Auto Stop RDS Instance (Mon-Fri 9:00 PM EST / 1:00 AM GMT)"
+            Schedule: !Ref AutoStopRDSSchedule
+            Enabled: true
+      Description: >-
+        Auto Stop RDS Instance (from tag : AutoStop)
+
+  RDSStopWeekDayLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: RDSStopWeekDay
+      Runtime: python3.9
+      MemorySize: 128
+      Handler: RDSStopWeekDay.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+              Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+      CodeUri: ./lambda/RDSStopWeekDay.py
+      Events:
+        RDSStopWeekDayRule:
+          Type: Schedule
+          Properties:
+            Name: RDSStopWeekDayRule
+            Description: "RDS Stop triggering every Week Day every 5 mins"
+            Schedule: !Ref RDSStartStopWeekDaySchedule
+            Enabled: true
+      Description: >-
+        RDS Stop Week Day Time in HH:MM	(from tag : StopWeekDay)
+
+  RDSStartWeekDayLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: RDSStartWeekDay
+      Runtime: python3.9
+      MemorySize: 128
+      Handler: RDSStartWeekDay.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+              Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+      CodeUri: ./lambda/RDSStartWeekDay.py
+      Events:
+        RDSStartWeekDayRule:
+          Type: Schedule
+          Properties:
+            Name: RDSStartWeekDayRule
+            Description: "RDS Start triggering every Week Day every 5 mins"
+            Schedule: !Ref RDSStartStopWeekDaySchedule
+            Enabled: true
+      Description: >-
+        RDS Start Week Day Time in HH:MM (from tag : StartWeekDay)
+
+  RDSStopWeekEndLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: RDSStopWeekEnd
+      Runtime: python3.9
+      MemorySize: 128
+      Handler: RDSStopWeekEnd.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+              Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+      CodeUri: ./lambda/RDSStopWeekEnd.py
+      Events:
+        RDSStopWeekEndRule:
+          Type: Schedule
+          Properties:
+            Name: RDSStopWeekEndRule
+            Description: "RDS Stop triggering every Week End every 5 mins"
+            Schedule: !Ref RDSStartStopWeekEndSchedule
+            Enabled: true
+      Description: >-
+        RDS Stop Week End Time in HH:MM	(from tag : StopWeekEnd)
+
+  RDSStartWeekEndLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: RDSStartWeekEnd
+      Runtime: python3.9
+      MemorySize: 128
+      Handler: RDSStartWeekEnd.lambda_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+          Variables:
+            REGION_TZ:
+              Ref: RegionTZ
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                - rds:StartDBInstance
+                - rds:StopDBInstance
+                - rds:StartDBCluster
+                - rds:StopDBCluster
+                - rds:ListTagsForResource
+              Resource:
+                - arn:aws:rds:*:*:db:*
+                - arn:aws:rds:*:*:cluster:*
+      CodeUri: ./lambda/RDSStartWeekEnd.py
+      Events:
+        RDSStartWeekEndRule:
+          Type: Schedule
+          Properties:
+            Name: RDSStartWeekEndRule
+            Description: "RDS Start triggering every Week End every 5 mins"
+            Schedule: !Ref RDSStartStopWeekEndSchedule
+            Enabled: true
+      Description: >-
+        RDS Start Week End Time in HH:MM (from tag : StartWeekEnd)
+
+Outputs:
+  RegionTZOutput:
+    Description: AWS Region Timezone
+    Value: !Ref RegionTZ
+
+  AWSRegionOutput:
+    Description: AWS Region
+    Value: !Ref AWS::Region
