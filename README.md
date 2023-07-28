@@ -123,6 +123,21 @@ Following AWS resources are created from this template :
       *	/aws/lambda/RDSStopWeekEnd
 
 
+## Source code on GitHub
+
+### Automate Start and Stop of Amazon RDS Instances to Save costs-
+If you want to <b>Automate Start and Stop of Amazon RDS Instances to Save costs</b> and implement this solution on Amazon RDS instance(s), refer GitHub URL https://github.com/aws-samples/aws-cfn-save-costs-auto-start-stop-rds
+
+### Automate Start and Stop of Amazon EC2 Instances to Save costs-
+If you want to <b>Automate Start and Stop of Amazon EC2 Instances to Save costs</b> and implement same solution on Amazon EC2 instance(s), refer GitHub URL https://github.com/aws-samples/aws-cfn-save-costs-auto-start-stop-ec2
+
+
+## AWS Database Blog
+
+### Save costs by automating the start and stop of Amazon RDS instances with AWS Lambda and Amazon EventBridge-
+If you want to <b>Automate Start and Stop of Amazon RDS Instances to Save costs</b> and implement this solution on Amazon RDS instance(s), refer Blog URL https://aws.amazon.com/blogs/database/save-costs-by-automating-the-start-and-stop-of-amazon-rds-instances-with-aws-lambda-and-amazon-eventbridge/
+
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
